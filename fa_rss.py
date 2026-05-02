@@ -1,20 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-RSS de estrenos en plataformas según FilmAffinity.
-
-Genera feeds para:
-- Movistar Plus+
-- Filmin
-- Prime Video España
-- HBO Max / Max España
-
-IMPORTANTE:
-FilmAffinity no ofrece RSS oficial. Este script lee sus páginas públicas y extrae
-los títulos fechados en cada plataforma. No incluye cartelera de cines.
-"""
-
 from __future__ import annotations
 
 import html
@@ -32,18 +18,22 @@ SOURCES = {
     "movistar": {
         "title": "Estrenos Movistar Plus+ - FilmAffinity",
         "url": "https://www.filmaffinity.com/es/cat_new_movistar_f.html",
+        "h1": "Movistar Plus+",
     },
     "filmin": {
         "title": "Estrenos Filmin - FilmAffinity",
         "url": "https://www.filmaffinity.com/es/cat_new_filmin.html",
+        "h1": "Filmin",
     },
     "prime-video": {
         "title": "Estrenos Prime Video España - FilmAffinity",
         "url": "https://www.filmaffinity.com/es/rdcat.php?id=new_amazon_es",
+        "h1": "Prime Video España",
     },
     "max-hbo": {
         "title": "Estrenos HBO Max / Max España - FilmAffinity",
         "url": "https://www.filmaffinity.com/es/cat_new_hbo_es.html",
+        "h1": "HBO Max España",
     },
 }
 
@@ -54,8 +44,6 @@ HEADERS = {
     ),
     "Accept-Language": "es-ES,es;q=0.9,en;q=0.7",
 }
-
-MAX_ITEMS = 80
 
 
 def clean(text: str) -> str:
@@ -68,74 +56,83 @@ def fetch(url: str) -> BeautifulSoup:
     return BeautifulSoup(response.text, "html.parser")
 
 
-def is_date_label(text: str) -> bool:
-    text = clean(text).lower()
+def is_date(text: str) -> bool:
+    t = clean(text).lower()
     return bool(
-        re.match(r"^\d{1,2}\s+[a-záéíóúñ]{3,}\.?$", text)
-        or re.match(r"^\d{1,2}\s+de\s+[a-záéíóúñ]+\s+de\s+\d{4}$", text)
-        or text == "hoy"
+        re.match(r"^\d{1,2}\s+[a-záéíóúñ]{3,}\.?$", t)
+        or re.match(r"^\d{1,2}\s+de\s+[a-záéíóúñ]+\s+de\s+\d{4}$", t)
+        or t == "hoy"
     )
 
 
-def is_film_url(href: str | None) -> bool:
+def is_title_link(href: str | None) -> bool:
     if not href:
         return False
-    return "/film" in href or "film" in href
+    return bool(re.search(r"/film\d+\.html", href))
 
 
-def extract_platform_premieres(soup: BeautifulSoup, base_url: str) -> list[dict]:
-    """
-    Extrae pares fecha + título desde las páginas de plataforma de FilmAffinity.
+def find_start_h1(soup: BeautifulSoup, expected: str):
+    expected_l = expected.lower()
+    for tag in soup.find_all(["h1", "h2"]):
+        if expected_l in clean(tag.get_text(" ")).lower():
+            return tag
 
-    En páginas tipo Movistar/Filmin/HBO:
-      <a>30 abr.</a> <a>Película</a>
+    for tag in soup.find_all(["h1", "h2"]):
+        txt = clean(tag.get_text(" ")).lower()
+        if "incorporaciones" in txt or "fecha de lanzamiento" in txt:
+            return tag
 
-    En páginas tipo rdcat Prime:
-      el patrón sigue siendo de enlaces fechados y enlaces a ficha.
-    """
+    return None
+
+
+def extract_items(soup: BeautifulSoup, page_url: str, expected_h1: str, max_items: int = 80) -> list[dict]:
+    start = find_start_h1(soup, expected_h1)
+    if start is None:
+        return []
+
     items = []
     seen = set()
-    current_date = ""
+    pending_dates = {}
 
-    # Trabajamos con todos los enlaces porque FilmAffinity usa el mismo enlace
-    # para la fecha y para el título en algunos listados.
-    for a in soup.find_all("a"):
-        text = clean(a.get_text(" "))
-        href = a.get("href")
+    for node in start.next_elements:
+        if getattr(node, "name", None) == "a":
+            text = clean(node.get_text(" "))
+            href = node.get("href")
 
-        if not text:
-            continue
+            if not text:
+                continue
 
-        if is_date_label(text):
-            current_date = text
-            continue
+            lower = text.lower()
+            if "próx" in lower or "mensaje" in lower or "twitter" in lower:
+                break
 
-        # Excluye navegación/categorías: queremos fichas de títulos.
-        if not is_film_url(href):
-            continue
+            if not is_title_link(href):
+                continue
 
-        # Evita falsos positivos: títulos demasiado cortos o duplicados.
-        link = urljoin(base_url, href)
-        key = (text.lower(), link)
+            abs_url = urljoin(page_url, href)
 
-        if key in seen:
-            continue
+            if is_date(text):
+                pending_dates[abs_url] = text
+                continue
 
-        seen.add(key)
+            if abs_url in seen:
+                continue
 
-        title = text
-        if current_date:
-            title = f"{title} — {current_date}"
+            if len(text) < 2:
+                continue
 
-        items.append({
-            "title": title,
-            "link": link,
-            "date_label": current_date,
-            "description": f"Estreno/incorporación en plataforma según FilmAffinity: {current_date}" if current_date else "Estreno/incorporación en plataforma según FilmAffinity",
-        })
+            seen.add(abs_url)
+            date_label = pending_dates.get(abs_url, "")
+            title = f"{text} — {date_label}" if date_label else text
 
-        if len(items) >= MAX_ITEMS:
-            break
+            items.append({
+                "title": title,
+                "link": abs_url,
+                "description": f"FilmAffinity: estreno/incorporación en plataforma{(' — ' + date_label) if date_label else ''}",
+            })
+
+            if len(items) >= max_items:
+                break
 
     return items
 
@@ -175,15 +172,14 @@ def main() -> None:
     for slug, cfg in SOURCES.items():
         print(f"Generando {slug}...")
         soup = fetch(cfg["url"])
-        items = extract_platform_premieres(soup, cfg["url"])
+        items = extract_items(soup, cfg["url"], cfg["h1"])
+
+        if not items:
+            raise RuntimeError(f"No se han encontrado títulos para {slug}. Puede haber cambiado el HTML de FilmAffinity.")
 
         out_file = out_dir / f"{slug}.xml"
-        out_file.write_text(
-            rss_xml(cfg["title"], cfg["url"], items),
-            encoding="utf-8",
-        )
-
-        print(f"  {len(items)} títulos -> {out_file}")
+        out_file.write_text(rss_xml(cfg["title"], cfg["url"], items), encoding="utf-8")
+        print(f"  OK: {len(items)} títulos -> {out_file}")
 
 
 if __name__ == "__main__":
