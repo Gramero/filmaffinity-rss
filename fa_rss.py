@@ -1,20 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-RSS de estrenos en plataformas según FilmAffinity.
-
-Genera feeds para:
-- Movistar Plus+
-- Filmin
-- Prime Video España
-- HBO Max / Max España
-
-IMPORTANTE:
-FilmAffinity no ofrece RSS oficial. Este script lee sus páginas públicas y extrae
-los títulos fechados en cada plataforma. No incluye cartelera de cines.
-"""
-
 from __future__ import annotations
 
 import html
@@ -32,30 +18,29 @@ SOURCES = {
     "movistar": {
         "title": "Estrenos Movistar Plus+ - FilmAffinity",
         "url": "https://www.filmaffinity.com/es/cat_new_movistar_f.html",
+        "id": "new_movistar_f",
     },
     "filmin": {
         "title": "Estrenos Filmin - FilmAffinity",
         "url": "https://www.filmaffinity.com/es/cat_new_filmin.html",
+        "id": "new_filmin",
     },
     "prime-video": {
         "title": "Estrenos Prime Video España - FilmAffinity",
         "url": "https://www.filmaffinity.com/es/rdcat.php?id=new_amazon_es",
+        "id": "new_amazon_es",
     },
     "max-hbo": {
         "title": "Estrenos HBO Max / Max España - FilmAffinity",
         "url": "https://www.filmaffinity.com/es/cat_new_hbo_es.html",
+        "id": "new_hbo_es",
     },
 }
 
 HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) "
-        "Gecko/20100101 Firefox/126.0"
-    ),
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0",
     "Accept-Language": "es-ES,es;q=0.9,en;q=0.7",
 }
-
-MAX_ITEMS = 80
 
 
 def clean(text: str) -> str:
@@ -63,78 +48,95 @@ def clean(text: str) -> str:
 
 
 def fetch(url: str) -> BeautifulSoup:
-    response = requests.get(url, headers=HEADERS, timeout=30)
-    response.raise_for_status()
-    return BeautifulSoup(response.text, "html.parser")
+    r = requests.get(url, headers=HEADERS, timeout=30)
+    r.raise_for_status()
+    return BeautifulSoup(r.text, "html.parser")
 
 
-def is_date_label(text: str) -> bool:
-    text = clean(text).lower()
+def is_date(text: str) -> bool:
+    t = clean(text).lower()
     return bool(
-        re.match(r"^\d{1,2}\s+[a-záéíóúñ]{3,}\.?$", text)
-        or re.match(r"^\d{1,2}\s+de\s+[a-záéíóúñ]+\s+de\s+\d{4}$", text)
-        or text == "hoy"
+        re.match(r"^\d{1,2}\s+[a-záéíóúñ]{3,}\.?$", t)
+        or re.match(r"^\d{1,2}\s+de\s+[a-záéíóúñ]+\s+de\s+\d{4}$", t)
+        or t == "hoy"
     )
 
 
-def is_film_url(href: str | None) -> bool:
-    if not href:
-        return False
-    return "/film" in href or "film" in href
+def is_real_film_link(href: str | None) -> bool:
+    return bool(href and re.search(r"/film\d+\.html", href))
 
 
-def extract_platform_premieres(soup: BeautifulSoup, base_url: str) -> list[dict]:
+def find_results_area(soup: BeautifulSoup, source_id: str):
     """
-    Extrae pares fecha + título desde las páginas de plataforma de FilmAffinity.
-
-    En páginas tipo Movistar/Filmin/HBO:
-      <a>30 abr.</a> <a>Película</a>
-
-    En páginas tipo rdcat Prime:
-      el patrón sigue siendo de enlaces fechados y enlaces a ficha.
+    Intenta localizar la zona real de resultados.
+    FilmAffinity mete muchos menús antes, así que NO recorremos toda la página.
     """
+    # En muchas páginas, la pestaña activa apunta al id de categoría.
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if source_id in href:
+            parent = a
+            for _ in range(8):
+                parent = parent.parent
+                if parent is None:
+                    break
+                links = parent.find_all("a", href=True)
+                film_links = [x for x in links if is_real_film_link(x.get("href"))]
+                if len(film_links) >= 3:
+                    return parent
+
+    # Fallback: busca el contenedor más pequeño con varias fichas /film123.html
+    candidates = []
+    for tag in soup.find_all(["div", "section", "main", "table"]):
+        film_links = [a for a in tag.find_all("a", href=True) if is_real_film_link(a.get("href"))]
+        if len(film_links) >= 3:
+            candidates.append((len(str(tag)), tag))
+
+    if candidates:
+        return sorted(candidates, key=lambda x: x[0])[0][1]
+
+    return soup
+
+
+def extract_items(soup: BeautifulSoup, page_url: str, source_id: str, max_items: int = 80) -> list[dict]:
+    area = find_results_area(soup, source_id)
+
     items = []
     seen = set()
+    pending_date_by_url = {}
     current_date = ""
 
-    # Trabajamos con todos los enlaces porque FilmAffinity usa el mismo enlace
-    # para la fecha y para el título en algunos listados.
-    for a in soup.find_all("a"):
+    for a in area.find_all("a", href=True):
         text = clean(a.get_text(" "))
         href = a.get("href")
 
         if not text:
             continue
 
-        if is_date_label(text):
+        if not is_real_film_link(href):
+            continue
+
+        link = urljoin(page_url, href)
+
+        if is_date(text):
             current_date = text
+            pending_date_by_url[link] = text
             continue
 
-        # Excluye navegación/categorías: queremos fichas de títulos.
-        if not is_film_url(href):
+        if link in seen:
             continue
 
-        # Evita falsos positivos: títulos demasiado cortos o duplicados.
-        link = urljoin(base_url, href)
-        key = (text.lower(), link)
+        seen.add(link)
+        date_label = pending_date_by_url.get(link, current_date)
 
-        if key in seen:
-            continue
-
-        seen.add(key)
-
-        title = text
-        if current_date:
-            title = f"{title} — {current_date}"
-
+        title = f"{text} — {date_label}" if date_label else text
         items.append({
             "title": title,
             "link": link,
-            "date_label": current_date,
-            "description": f"Estreno/incorporación en plataforma según FilmAffinity: {current_date}" if current_date else "Estreno/incorporación en plataforma según FilmAffinity",
+            "description": f"Estreno/incorporación en plataforma según FilmAffinity{(' — ' + date_label) if date_label else ''}",
         })
 
-        if len(items) >= MAX_ITEMS:
+        if len(items) >= max_items:
             break
 
     return items
@@ -142,7 +144,6 @@ def extract_platform_premieres(soup: BeautifulSoup, base_url: str) -> list[dict]
 
 def rss_xml(channel_title: str, channel_link: str, items: list[dict]) -> str:
     now = format_datetime(datetime.now(timezone.utc))
-
     lines = [
         '<?xml version="1.0" encoding="UTF-8"?>',
         '<rss version="2.0">',
@@ -154,7 +155,7 @@ def rss_xml(channel_title: str, channel_link: str, items: list[dict]) -> str:
     ]
 
     for item in items:
-        lines.extend([
+        lines += [
             "<item>",
             f"<title>{html.escape(item['title'])}</title>",
             f"<link>{html.escape(item['link'])}</link>",
@@ -162,9 +163,9 @@ def rss_xml(channel_title: str, channel_link: str, items: list[dict]) -> str:
             f"<description>{html.escape(item['description'])}</description>",
             f"<pubDate>{now}</pubDate>",
             "</item>",
-        ])
+        ]
 
-    lines.extend(["</channel>", "</rss>"])
+    lines += ["</channel>", "</rss>"]
     return "\n".join(lines)
 
 
@@ -175,15 +176,14 @@ def main() -> None:
     for slug, cfg in SOURCES.items():
         print(f"Generando {slug}...")
         soup = fetch(cfg["url"])
-        items = extract_platform_premieres(soup, cfg["url"])
+        items = extract_items(soup, cfg["url"], cfg["id"])
+
+        if not items:
+            raise RuntimeError(f"No se encontraron títulos para {slug}")
 
         out_file = out_dir / f"{slug}.xml"
-        out_file.write_text(
-            rss_xml(cfg["title"], cfg["url"], items),
-            encoding="utf-8",
-        )
-
-        print(f"  {len(items)} títulos -> {out_file}")
+        out_file.write_text(rss_xml(cfg["title"], cfg["url"], items), encoding="utf-8")
+        print(f"OK: {out_file} ({len(items)} items)")
 
 
 if __name__ == "__main__":
