@@ -30,11 +30,10 @@ SOURCES = {
         "url": "https://www.filmaffinity.com/es/rdcat.php?id=new_amazon_es",
         "id": "new_amazon_es",
     },
-    "max-hbo": {
-        "title": "Estrenos HBO Max / Max España - FilmAffinity",
-        "url": "https://www.filmaffinity.com/es/cat_new_hbo_es.html",
-        "id": "new_hbo_es",
-    },
+    "cartelera": {
+        "title": "Estrenos en cartelera - FilmAffinity",
+        "url": "https://www.filmaffinity.com/es/rdcat.php?id=new_th_es",
+},
 }
 
 HEADERS = {
