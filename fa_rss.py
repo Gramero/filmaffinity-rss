@@ -18,26 +18,26 @@ SOURCES = {
     "movistar": {
         "title": "Estrenos Movistar Plus+ - FilmAffinity",
         "url": "https://www.filmaffinity.com/es/cat_new_movistar_f.html",
-        "id": "new_movistar_f",
     },
     "filmin": {
         "title": "Estrenos Filmin - FilmAffinity",
         "url": "https://www.filmaffinity.com/es/cat_new_filmin.html",
-        "id": "new_filmin",
     },
     "prime-video": {
         "title": "Estrenos Prime Video España - FilmAffinity",
         "url": "https://www.filmaffinity.com/es/rdcat.php?id=new_amazon_es",
-        "id": "new_amazon_es",
     },
     "cartelera": {
         "title": "Estrenos en cartelera - FilmAffinity",
         "url": "https://www.filmaffinity.com/es/rdcat.php?id=new_th_es",
-},
+    },
 }
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36"
+    ),
     "Accept-Language": "es-ES,es;q=0.9,en;q=0.7",
 }
 
@@ -47,22 +47,22 @@ def clean(text: str) -> str:
 
 
 def fetch(url: str) -> BeautifulSoup:
-    r = requests.get(url, headers=HEADERS, timeout=30)
-    r.raise_for_status()
-    return BeautifulSoup(r.text, "html.parser")
+    response = requests.get(url, headers=HEADERS, timeout=30)
+    response.raise_for_status()
+    return BeautifulSoup(response.text, "html.parser")
 
 
 def is_date(text: str) -> bool:
-    t = clean(text).lower()
+    text = clean(text).lower()
     return bool(
-        re.match(r"^\d{1,2}\s+[a-záéíóúñ]{3,}\.?$", t)
-        or re.match(r"^\d{1,2}\s+de\s+[a-záéíóúñ]+\s+de\s+\d{4}$", t)
-        or t == "hoy"
+        re.match(r"^\d{1,2}\s+[a-záéíóúñ]{3,}\.?$", text)
+        or re.match(r"^\d{1,2}\s+de\s+[a-záéíóúñ]+\s+de\s+\d{4}$", text)
+        or text == "hoy"
     )
 
 
 def is_real_film_link(href: str | None) -> bool:
-    return bool(href and re.search(r"/film\d+\.html", href))
+    return bool(href and re.search(r"/film\d+\.html$", href))
 
 
 def extract_items(soup: BeautifulSoup, page_url: str, max_items: int = 80) -> list[dict]:
@@ -74,10 +74,7 @@ def extract_items(soup: BeautifulSoup, page_url: str, max_items: int = 80) -> li
         text = clean(a.get_text(" "))
         href = a.get("href")
 
-        if not text:
-            continue
-
-        if not is_real_film_link(href):
+        if not text or not is_real_film_link(href):
             continue
 
         link = urljoin(page_url, href)
@@ -90,13 +87,12 @@ def extract_items(soup: BeautifulSoup, page_url: str, max_items: int = 80) -> li
             continue
 
         seen.add(link)
-
         title = f"{text} — {current_date}" if current_date else text
 
         items.append({
             "title": title,
             "link": link,
-            "description": f"Estreno/incorporación en plataforma según FilmAffinity{(' — ' + current_date) if current_date else ''}",
+            "description": f"Estreno/incorporación según FilmAffinity{(' — ' + current_date) if current_date else ''}",
         })
 
         if len(items) >= max_items:
@@ -120,16 +116,16 @@ def rss_xml(channel_title: str, channel_link: str, items: list[dict]) -> str:
 
     for item in items:
         lines.extend([
-            "<item>",
-            f"<title>{html.escape(item['title'])}</title>",
-            f"<link>{html.escape(item['link'])}</link>",
-            f"<guid isPermaLink=\"true\">{html.escape(item['link'])}</guid>",
-            f"<description>{html.escape(item['description'])}</description>",
-            f"<pubDate>{now}</pubDate>",
-            "</item>",
+            '<item>',
+            f'<title>{html.escape(item["title"])}</title>',
+            f'<link>{html.escape(item["link"])}</link>',
+            f'<guid isPermaLink="true">{html.escape(item["link"])}</guid>',
+            f'<description>{html.escape(item["description"])}</description>',
+            f'<pubDate>{now}</pubDate>',
+            '</item>',
         ])
 
-    lines.extend(["</channel>", "</rss>"])
+    lines.extend(['</channel>', '</rss>'])
     return "\n".join(lines)
 
 
