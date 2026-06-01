@@ -31,6 +31,26 @@ SOURCES = {
         "title": "Estrenos en cartelera - FilmAffinity",
         "url": "https://www.filmaffinity.com/es/rdcat.php?id=new_th_es",
     },
+        "hbo-max": {
+        "title": "Estrenos HBO Max / Max España - FilmAffinity",
+        "url": "https://www.filmaffinity.com/es/rdcat.php?id=new_hbo_es",
+    },
+    "netflix": {
+        "title": "Estrenos Netflix España - FilmAffinity",
+        "url": "https://www.filmaffinity.com/es/rdcat.php?id=new_netflix",
+    },
+    "apple-tv-plus": {
+        "title": "Estrenos Apple TV+ - FilmAffinity",
+        "url": "https://www.filmaffinity.com/es/rdcat.php?id=apple_tv_plus",
+    },
+    "skyshowtime": {
+        "title": "Estrenos SkyShowtime - FilmAffinity",
+        "url": "https://www.filmaffinity.com/es/rdcat.php?id=skyshowtime",
+    },
+    "disney-plus": {
+        "title": "Estrenos Disney+ España - FilmAffinity",
+        "url": "https://www.filmaffinity.com/es/rdcat.php?id=disneyplus",
+    },
 }
 
 HEADERS = {
