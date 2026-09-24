@@ -2,7 +2,7 @@ name: Actualizar RSS FilmAffinity plataformas
 
 on:
   schedule:
-    - cron: "0 */6 * * *"
+    - cron: "7 */3 * * *"
   workflow_dispatch:
 
 permissions:
