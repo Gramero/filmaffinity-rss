@@ -3,7 +3,7 @@ name: Actualizar RSS El Correo de Andalucía
 on:
   workflow_dispatch:
   schedule:
-    - cron: "17 * * * *"
+    - cron: "7,22,37,52 * * * *"
 
 permissions:
   contents: write
