@@ -1,292 +1,182 @@
 #!/usr/bin/env python3
-"""Build RSS feeds for El Correo de Andalucía's Sevilla and Andalucía sections.
+"""Generate El Correo Sevilla and Andalucía RSS feeds via FreeNewsAPI.
 
-Uses only the Python standard library. Article titles, canonical URLs and
-publication timestamps are taken from article metadata, not from URL slugs or
-the date printed in the section listing.
+The El Correo site returns HTTP 403 to GitHub Actions, so this script uses the
+public structured feed index instead. It keeps the established output names
+consumed by Protopage and classifies entries by canonical URL section, falling
+back to the publisher section labels returned as `categories`.
 """
 
 from __future__ import annotations
 
-import concurrent.futures
 import email.utils
-import html
 import json
 import re
 import sys
-import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
-from html.parser import HTMLParser
 from pathlib import Path
 
 
-BASE = "https://www.elcorreoweb.es"
+API_URL = "https://freenewsapi.ai/v1/search"
+PUBLISHER_HOST = "www.elcorreoweb.es"
 OUT_DIR = Path("feeds")
-MAX_ARTICLES_PER_SECTION = 60
-WORKERS = 8
-USER_AGENT = (
-    "Mozilla/5.0 (compatible; ElCorreoRSS/1.0; "
-    "+https://github.com/gramero/filmaffinity-rss)"
-)
+PAGE_SIZE = 100
+MAX_PAGES = 12
+ITEMS_PER_FEED = 50
+USER_AGENT = "ElCorreoRSS/2.0 (RSS feed builder)"
 
 SOURCES = {
-    "elcorreoweb-sevilla": {
-        "section": "sevilla",
-        "url": f"{BASE}/sevilla/",
-        "feed_title": "El Correo de Andalucía - Sevilla",
+    "sevilla": {
+        "title": "El Correo de Andalucía - Sevilla",
         "description": "Últimas noticias de Sevilla - El Correo de Andalucía",
-        "file": "elcorreoweb-sevilla.xml",
+        "section_label": "sevilla",
+        "section_path": "/sevilla/",
+        "feed_url": "https://www.elcorreoweb.es/sevilla/",
+        "filename": "elcorreoweb-sevilla.xml",
     },
-    "elcorreoweb-andalucia": {
-        "section": "andalucia",
-        "url": f"{BASE}/andalucia/",
-        "feed_title": "El Correo de Andalucía - Andalucía",
+    "andalucia": {
+        "title": "El Correo de Andalucía - Andalucía",
         "description": "Últimas noticias de Andalucía - El Correo de Andalucía",
-        "file": "elcorreoweb-andalucia.xml",
+        "section_label": "andalucía",
+        "section_path": "/andalucia/",
+        "feed_url": "https://www.elcorreoweb.es/andalucia/",
+        "filename": "elcorreoweb-andalucia.xml",
     },
 }
 
 
-def clean(value: object) -> str:
-    if value is None:
-        return ""
-    return re.sub(r"\s+", " ", html.unescape(str(value))).strip()
-
-
-def fetch(url: str) -> str:
+def fetch_page(offset: int) -> list[dict]:
+    query = urllib.parse.urlencode(
+        {
+            "host": PUBLISHER_HOST,
+            "size": PAGE_SIZE,
+            "offset": offset,
+            "sort": "date",
+            "fields": "title,url,published_at,description,categories",
+        }
+    )
     request = urllib.request.Request(
-        url,
+        f"{API_URL}?{query}",
         headers={
             "User-Agent": USER_AGENT,
-            "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
-            "Accept-Language": "es-ES,es;q=0.9,en;q=0.7",
+            "Accept": "application/json",
         },
     )
-    with urllib.request.urlopen(request, timeout=30) as response:
-        charset = response.headers.get_content_charset() or "utf-8"
-        return response.read().decode(charset, errors="replace")
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"No se pudo consultar la fuente de noticias: {exc}") from exc
+
+    results = data.get("results")
+    if not isinstance(results, list):
+        raise RuntimeError("La respuesta de la fuente no contiene la lista esperada de noticias.")
+    return [entry for entry in results if isinstance(entry, dict)]
 
 
-class PageParser(HTMLParser):
-    """Collect page metadata, JSON-LD, headings, times and article links."""
+def section_of(entry: dict) -> str | None:
+    """Use the article URL's section path; publisher categories are fallback."""
+    parsed = urllib.parse.urlsplit(str(entry.get("url", "")))
+    path = urllib.parse.unquote(parsed.path).lower()
+    if parsed.hostname and parsed.hostname.lower() in {PUBLISHER_HOST, "elcorreoweb.es"}:
+        for name, cfg in SOURCES.items():
+            prefix = cfg["section_path"]
+            if path.startswith(prefix) and re.match(r"^/[^/]+/\d{4}/\d{2}/\d{2}/", path):
+                return name
 
-    def __init__(self, page_url: str, section: str):
-        super().__init__(convert_charrefs=True)
-        self.page_url = page_url
-        self.section = section
-        self.meta: dict[str, str] = {}
-        self.links: list[tuple[str, str]] = []
-        self.jsonld: list[str] = []
-        self.times: list[tuple[str, str]] = []
-        self.h1: list[str] = []
-        self._title: list[str] = []
-        self._capture: str | None = None
-        self._capture_parts: list[str] = []
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        a = {k.lower(): (v or "") for k, v in attrs}
-        if tag == "meta":
-            key = (a.get("property") or a.get("name") or a.get("itemprop")).lower()
-            if key and a.get("content"):
-                self.meta.setdefault(key, a["content"])
-        elif tag == "link" and "canonical" in a.get("rel", "").lower().split():
-            self.meta.setdefault("canonical", a.get("href", ""))
-        elif tag == "time":
-            value = a.get("datetime") or a.get("content")
-            if value:
-                self.times.append((a.get("itemprop", "").lower(), value))
-        elif tag == "a" and a.get("href"):
-            absolute = urllib.parse.urljoin(self.page_url, a["href"])
-            if self.is_article_url(absolute):
-                self._capture = "link"
-                self._capture_parts = [absolute]
-        elif tag == "script" and a.get("type", "").lower() == "application/ld+json":
-            self._capture = "jsonld"
-            self._capture_parts = []
-        elif tag == "title":
-            self._capture = "title"
-            self._capture_parts = []
-        elif tag == "h1":
-            self._capture = "h1"
-            self._capture_parts = []
-
-    def handle_endtag(self, tag: str) -> None:
-        if tag == "a" and self._capture == "link":
-            self.links.append((self._capture_parts[0], clean("".join(self._capture_parts[1:]))))
-            self._capture = None
-        elif tag == "script" and self._capture == "jsonld":
-            self.jsonld.append("".join(self._capture_parts))
-            self._capture = None
-        elif tag == "title" and self._capture == "title":
-            self.meta.setdefault("document_title", clean("".join(self._capture_parts)))
-            self._capture = None
-        elif tag == "h1" and self._capture == "h1":
-            self.h1.append(clean("".join(self._capture_parts)))
-            self._capture = None
-
-    def handle_data(self, data: str) -> None:
-        if self._capture:
-            self._capture_parts.append(data)
-
-    def is_article_url(self, url: str) -> bool:
-        p = urllib.parse.urlsplit(url)
-        path = urllib.parse.unquote(p.path)
-        if p.netloc.lower() not in {"www.elcorreoweb.es", "elcorreoweb.es"}:
-            return False
-        return bool(re.search(rf"/{re.escape(self.section)}/\d{{4}}/\d{{2}}/\d{{2}}/[^/]+\.html$", path, re.I))
+    categories = entry.get("categories") or []
+    if isinstance(categories, str):
+        categories = [categories]
+    normalized = {str(category).strip().casefold() for category in categories}
+    for name, cfg in SOURCES.items():
+        if cfg["section_label"] in normalized:
+            return name
+    return None
 
 
-def canonicalize(url: str, section: str) -> str | None:
-    p = urllib.parse.urlsplit(urllib.parse.urljoin(BASE, url))
-    if p.netloc.lower() not in {"www.elcorreoweb.es", "elcorreoweb.es"}:
-        return None
-    path = urllib.parse.unquote(p.path)
-    if not re.search(rf"/{re.escape(section)}/\d{{4}}/\d{{2}}/\d{{2}}/[^/]+\.html$", path, re.I):
-        return None
-    return urllib.parse.urlunsplit(("https", "www.elcorreoweb.es", path, "", ""))
-
-
-def walk_json(value: object):
-    if isinstance(value, dict):
-        yield value
-        for child in value.values():
-            yield from walk_json(child)
-    elif isinstance(value, list):
-        for child in value:
-            yield from walk_json(child)
-
-
-def parse_datetime(raw: object) -> datetime | None:
-    value = clean(raw)
+def parse_datetime(value: object) -> datetime | None:
     if not value:
         return None
+    raw = str(value).strip()
     try:
-        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        result = datetime.fromisoformat(raw.replace("Z", "+00:00"))
     except ValueError:
         try:
-            dt = email.utils.parsedate_to_datetime(value)
+            result = email.utils.parsedate_to_datetime(raw)
         except (TypeError, ValueError, OverflowError):
             return None
-    if dt.tzinfo is None:
-        # Publisher timestamps without an offset are local Spanish editorial time.
-        # In the absence of an explicit offset, interpret as UTC to keep RSS valid.
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
+    if result.tzinfo is None:
+        result = result.replace(tzinfo=timezone.utc)
+    return result.astimezone(timezone.utc)
 
 
-def article_data(url: str, section: str) -> dict | None:
-    try:
-        source = fetch(url)
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        print(f"Skipping article ({url}): {exc}", file=sys.stderr)
-        return None
+def collect_articles() -> dict[str, list[dict]]:
+    collected = {name: [] for name in SOURCES}
+    seen = {name: set() for name in SOURCES}
+    for page_number in range(MAX_PAGES):
+        entries = fetch_page(page_number * PAGE_SIZE)
+        if not entries:
+            break
+        for entry in entries:
+            section = section_of(entry)
+            if section not in SOURCES:
+                continue
+            url = str(entry.get("url", "")).strip()
+            title = re.sub(r"\s+", " ", str(entry.get("title", ""))).strip()
+            published = parse_datetime(entry.get("published_at"))
+            if not url or not title or not published or url in seen[section]:
+                continue
+            seen[section].add(url)
+            collected[section].append(
+                {
+                    "url": url,
+                    "title": title,
+                    "description": re.sub(r"\s+", " ", str(entry.get("description", ""))).strip(),
+                    "published": published,
+                }
+            )
+        if all(len(items) >= ITEMS_PER_FEED for items in collected.values()):
+            break
+        if len(entries) < PAGE_SIZE:
+            break
 
-    parser = PageParser(url, section)
-    parser.feed(source)
-    final_url = canonicalize(parser.meta.get("canonical", url), section) or url
-
-    title = ""
-    published: datetime | None = None
-    modified: datetime | None = None
-    description = ""
-    json_articles = []
-    for raw in parser.jsonld:
-        try:
-            parsed = json.loads(raw)
-        except (json.JSONDecodeError, TypeError):
-            continue
-        for node in walk_json(parsed):
-            types = node.get("@type", [])
-            if isinstance(types, str):
-                types = [types]
-            if any("article" in t.lower() or "news" in t.lower() for t in types):
-                json_articles.append(node)
-    for node in json_articles:
-        title = title or clean(node.get("headline") or node.get("name"))
-        published = published or parse_datetime(node.get("datePublished"))
-        modified = modified or parse_datetime(node.get("dateModified"))
-        description = description or clean(node.get("description"))
-
-    title = title or clean(parser.meta.get("og:title")) or clean(parser.meta.get("twitter:title"))
-    title = title or clean(parser.meta.get("document_title")) or (parser.h1[0] if parser.h1 else "")
-    description = description or clean(parser.meta.get("og:description")) or clean(parser.meta.get("description"))
-    published = published or parse_datetime(parser.meta.get("article:published_time"))
-    published = published or parse_datetime(parser.meta.get("datepublished"))
-    modified = modified or parse_datetime(parser.meta.get("article:modified_time"))
-    modified = modified or parse_datetime(parser.meta.get("datemodified"))
-    for prop, value in parser.times:
-        if prop in {"datepublished", "datepublished"}:
-            published = published or parse_datetime(value)
-        elif prop in {"datemodified", "dateupdated"}:
-            modified = modified or parse_datetime(value)
-
-    # Prefer the original publication date. Use the update date only when the
-    # publisher omits publication metadata; never infer a date from the URL.
-    published = published or modified
-    if not title or not published:
-        print(f"Skipping article without headline/publication metadata: {url}", file=sys.stderr)
-        return None
-    title = re.sub(r"\s*[|–-]\s*El Correo de Andalucía\s*$", "", title, flags=re.I).strip()
-    return {
-        "title": title,
-        "url": final_url,
-        "published": published,
-        "description": description,
-    }
+    for name, items in collected.items():
+        items.sort(key=lambda article: article["published"], reverse=True)
+        collected[name] = items[:ITEMS_PER_FEED]
+        if not collected[name]:
+            raise RuntimeError(
+                f"La fuente no devolvió noticias identificables para {SOURCES[name]['title']}; "
+                "se conserva el XML publicado anterior."
+            )
+    return collected
 
 
-def get_section_articles(source: dict) -> list[dict]:
-    page = fetch(source["url"])
-    parser = PageParser(source["url"], source["section"])
-    parser.feed(page)
-    urls: list[str] = []
-    seen: set[str] = set()
-    for href, _anchor_title in parser.links:
-        normalized = canonicalize(href, source["section"])
-        if normalized and normalized not in seen:
-            seen.add(normalized)
-            urls.append(normalized)
-    if not urls:
-        raise RuntimeError(f"No se encontraron enlaces de artículos en {source['url']}; se conserva el XML publicado anterior.")
-
-    urls = urls[:MAX_ARTICLES_PER_SECTION]
-    articles: list[dict] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as pool:
-        futures = [pool.submit(article_data, url, source["section"]) for url in urls]
-        for future in concurrent.futures.as_completed(futures):
-            try:
-                item = future.result()
-            except Exception as exc:
-                print(f"Article parse failed: {exc}", file=sys.stderr)
-                item = None
-            if item:
-                articles.append(item)
-    articles.sort(key=lambda x: x["published"], reverse=True)
-    if not articles:
-        raise RuntimeError(f"No se pudieron extraer artículos válidos de {source['url']}; se conserva el XML publicado anterior.")
-    return articles
-
-
-def build_xml(source: dict, articles: list[dict]) -> bytes:
+def make_xml(section: str, articles: list[dict]) -> bytes:
+    cfg = SOURCES[section]
     rss = ET.Element("rss", {"version": "2.0"})
     channel = ET.SubElement(rss, "channel")
-    ET.SubElement(channel, "title").text = source["feed_title"]
-    ET.SubElement(channel, "link").text = source["url"]
-    ET.SubElement(channel, "description").text = source["description"]
+    ET.SubElement(channel, "title").text = cfg["title"]
+    ET.SubElement(channel, "link").text = cfg["feed_url"]
+    ET.SubElement(channel, "description").text = cfg["description"]
     ET.SubElement(channel, "language").text = "es-ES"
-    ET.SubElement(channel, "lastBuildDate").text = email.utils.format_datetime(datetime.now(timezone.utc), usegmt=True)
+    ET.SubElement(channel, "lastBuildDate").text = email.utils.format_datetime(
+        datetime.now(timezone.utc), usegmt=True
+    )
+
     for article in articles:
         item = ET.SubElement(channel, "item")
         ET.SubElement(item, "title").text = article["title"]
         ET.SubElement(item, "link").text = article["url"]
-        guid = ET.SubElement(item, "guid", {"isPermaLink": "true"})
-        guid.text = article["url"]
+        ET.SubElement(item, "guid", {"isPermaLink": "true"}).text = article["url"]
         ET.SubElement(item, "description").text = article["description"] or article["title"]
-        ET.SubElement(item, "pubDate").text = email.utils.format_datetime(article["published"], usegmt=True)
+        ET.SubElement(item, "pubDate").text = email.utils.format_datetime(
+            article["published"], usegmt=True
+        )
+
     return ET.tostring(rss, encoding="utf-8", xml_declaration=True)
 
 
@@ -298,19 +188,21 @@ def atomic_write(path: Path, contents: bytes) -> None:
 
 
 def main() -> None:
-    failures = []
-    for feed_id, source in SOURCES.items():
-        try:
-            articles = get_section_articles(source)
-            xml_bytes = build_xml(source, articles)
-            atomic_write(OUT_DIR / source["file"], xml_bytes)
-            print(f"{feed_id}: {len(articles)} articles -> {OUT_DIR / source['file']}")
-        except Exception as exc:
-            failures.append((feed_id, exc))
-            print(f"ERROR {feed_id}: {exc}", file=sys.stderr)
-    if failures:
-        raise SystemExit(1)
+    feeds = collect_articles()
+    # Build both documents before writing either, so a partial API failure
+    # cannot publish one fresh section beside one stale section.
+    outputs = {
+        OUT_DIR / SOURCES[name]["filename"]: make_xml(name, articles)
+        for name, articles in feeds.items()
+    }
+    for path, contents in outputs.items():
+        atomic_write(path, contents)
+        print(f"{path}: generado con {len(feeds[path.stem.removeprefix('elcorreoweb-')])} noticias")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        raise SystemExit(1)
